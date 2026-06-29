@@ -29,7 +29,7 @@ config.yaml
 *.env
 
 # 运行状态
-state/*.json
+state/
 *.log
 
 # IDE

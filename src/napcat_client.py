@@ -105,21 +105,21 @@ class NapCatWebhookServer:
     """接收 NapCat HTTP 上报的 webhook 服务。
 
     NapCat 收到群消息后会 POST 到本服务，触发回调。
-    若设置 target_group_id，则只处理该群消息，其他群消息直接丢弃。
+    若设置 target_group_ids，则只处理这些群的消息，其他群消息直接丢弃。
     """
 
-    def __init__(self, host: str, port: int, on_message: Callable[[dict], None],
-                 target_group_id: Optional[str] = None):
+    def __init__(self, host: str, port: int, on_message: Callable[[str, dict], None],
+                 target_group_ids: Optional[list[str]] = None):
         self.host = host
         self.port = port
         self.on_message = on_message
-        self.target_group_id = target_group_id
+        self.target_group_ids = target_group_ids or []
         self._server: Optional[HTTPServer] = None
 
     def start(self):
         """启动 webhook 服务（阻塞）。"""
         on_message = self.on_message
-        target_group_id = self.target_group_id
+        target_group_ids = self.target_group_ids
 
         class Handler(BaseHTTPRequestHandler):
             def _read_body(self):
@@ -164,14 +164,14 @@ class NapCatWebhookServer:
                     if post_type == "message" and data.get("message_type") == "group":
                         # 群过滤：只处理目标群消息，其他群直接丢弃
                         msg_group_id = str(data.get("group_id", ""))
-                        if target_group_id and msg_group_id != target_group_id:
+                        if target_group_ids and msg_group_id not in target_group_ids:
                             logger.debug(
                                 f"丢弃非目标群消息：group_id={msg_group_id} "
-                                f"(期望 {target_group_id}) user={data.get('user_id')}"
+                                f"(期望 {target_group_ids}) user={data.get('user_id')}"
                             )
                         else:
-                            # 异步处理消息，do_POST 立即返回 200，避免阻塞 NapCat
-                            Thread(target=on_message, args=(data,), daemon=True).start()
+                            # 异步处理消息，传递 group_id 给回调，do_POST 立即返回 200
+                            Thread(target=on_message, args=(msg_group_id, data), daemon=True).start()
                 except Exception as e:
                     logger.error(f"处理上报失败: {e}")
                 self.send_response(200)

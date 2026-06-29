@@ -42,20 +42,24 @@ SOFT_COOLDOWN_MAX = 90          # 软因子触发冷却上限
 QUIET_WINDOW_SECONDS = 20       # 静默窗口：N 秒无新消息后兜底触发
 
 
-class Bot:
-    """机器人主控制器。"""
+class GroupBot:
+    """单个群的机器人控制器。"""
 
-    def __init__(self, config_path: str = "config.yaml"):
-        self.config = load_config(config_path)
+    def __init__(self, group_id: str, config, llm: LLMClient, persona_renderer: PersonaRenderer):
+        self.group_id = group_id
+        self.config = config
 
-        # 核心组件
-        self.napcat = NapCatClient(self.config.napcat.base_url, self.config.napcat.group_id)
-        self.llm = LLMClient(self.config)
-        self.history = HistoryManager(self.config.trigger)
-        self.attribution = AttributionManager(self.config)
-        self.affinity = AffinityManager()
-        self.persona_renderer = PersonaRenderer(self.config)
-        self.scheduler = ActiveScheduler(self.config)
+        # 按群号隔离状态目录
+        self.state_dir = f"state/{group_id}"
+
+        # 核心组件（群独立）
+        self.napcat = NapCatClient(config.napcat.base_url, group_id)
+        self.llm = llm
+        self.history = HistoryManager(config.trigger, state_dir=self.state_dir)
+        self.attribution = AttributionManager(config, state_dir=self.state_dir)
+        self.affinity = AffinityManager(state_dir=self.state_dir)
+        self.persona_renderer = persona_renderer
+        self.scheduler = ActiveScheduler(config, state_dir=self.state_dir)
 
         # Sender 实现
         self.message_sender = NapCatMessageSender(self.napcat)
@@ -103,12 +107,6 @@ class Bot:
         4. 无论如何重置静默定时器（每条新消息都推迟兜底触发）
         """
         try:
-            # 防御性群过滤
-            msg_group_id = str(msg.get("group_id", ""))
-            if msg_group_id and msg_group_id != self.config.napcat.group_id:
-                logger.debug(f"on_group_message 丢弃非目标群消息：{msg_group_id}")
-                return
-
             sender_qq = str(msg.get("user_id", ""))
             sender_nick = self.napcat.get_nickname(sender_qq)
             content = _extract_text_from_msg(msg) or msg.get("raw_message", "")
@@ -355,9 +353,11 @@ class Bot:
             return
 
         # reply / multi_reply
+        # 强制合并：messages 超过 2 条时，将多条纯文本合并为 1-2 条
+        merged_messages = self._merge_messages(parsed.messages)
         # _send_messages 内部每条发送完成后会逐条 append 到 fast_buffer（is_bot=True），
         # 与此期间群成员的新消息按真实 append 顺序混合，下一轮 drain 时进入 pending。
-        self._send_messages(parsed.messages)
+        self._send_messages(merged_messages)
         self.last_reply_time = time.time()
 
         # 亲密度更新
@@ -366,6 +366,33 @@ class Bot:
         # 归因更新（主动触发时 soft_factors=None，跳过）
         if soft_factors is not None:
             self.attribution.update(soft_factors, parsed.action)
+
+    def _merge_messages(self, messages: list) -> list:
+        """强制合并消息：超过 2 条时，将纯文本消息合并为最多 2 条，内容不删减。"""
+        if len(messages) <= 2:
+            return messages
+
+        # 分离纯文本和非文本消息
+        text_parts = []
+        non_text = []
+        for msg in messages:
+            if isinstance(msg, str):
+                text_parts.append(msg)
+            elif isinstance(msg, dict) and msg.get("type") == "text":
+                text_parts.append(msg["data"].get("text", ""))
+            else:
+                non_text.append(msg)
+
+        # 合并所有纯文本为一条，非文本段保留（但总量仍限制 2 条）
+        merged = []
+        if text_parts:
+            merged_text = "\n".join(text_parts)
+            merged.append(merged_text)
+        if non_text:
+            merged.append(non_text[0])  # 只保留第一个非文本段
+
+        # 如果合并后仍超过 2 条，截断到 2 条
+        return merged[:2]
 
     def _send_messages(self, messages: list):
         """发送消息列表，带间隔。
@@ -441,23 +468,55 @@ class Bot:
             })
         return result
 
-    def run(self, webhook_host: str = "0.0.0.0", webhook_port: int = 8081):
-        """启动机器人。"""
-        self.warmup()
-        server = NapCatWebhookServer(
-            webhook_host, webhook_port, self.on_group_message,
-            target_group_id=self.config.napcat.group_id,
-        )
-        # 启动主动触发调度器
+    def start_scheduler(self):
+        """启动主动触发调度器。"""
         if self.config.active_trigger and self.config.active_trigger.enabled:
             self.scheduler.start(self.on_active_trigger)
-            logger.info(f"主动触发调度器已启动：{self.config.active_trigger.min_interval_minutes}-"
+            logger.info(f"[群{self.group_id}] 主动触发调度器已启动：{self.config.active_trigger.min_interval_minutes}-"
                         f"{self.config.active_trigger.max_interval_minutes} 分钟随机，"
                         f"深夜 {self.config.active_trigger.night_start_hour}:00-"
                         f"{self.config.active_trigger.night_end_hour}:00 禁用")
-        else:
-            logger.info("主动触发调度器已禁用")
-        logger.info(f"机器人启动（仅监听群 {self.config.napcat.group_id}）")
+
+
+class MultiGroupBot:
+    """多群机器人协调器。"""
+
+    def __init__(self, config_path: str = "config.yaml"):
+        self.config = load_config(config_path)
+
+        # 共享组件（跨群共用）
+        self.llm = LLMClient(self.config)
+        self.persona_renderer = PersonaRenderer(self.config)
+
+        # 为每个群创建独立的 GroupBot
+        self.group_bots: dict[str, GroupBot] = {}
+        for group_id in self.config.napcat.group_ids:
+            bot = GroupBot(group_id, self.config, self.llm, self.persona_renderer)
+            self.group_bots[group_id] = bot
+
+    def on_message(self, group_id: str, msg: dict):
+        """Webhook 回调：按 group_id 分发到对应 GroupBot。"""
+        bot = self.group_bots.get(group_id)
+        if bot is None:
+            logger.debug(f"收到非目标群消息：{group_id}，丢弃")
+            return
+        bot.on_group_message(msg)
+
+    def run(self, webhook_host: str = "0.0.0.0", webhook_port: int = 8081):
+        """启动机器人。"""
+        # 预热所有群
+        for group_id, bot in self.group_bots.items():
+            bot.warmup()
+            bot.start_scheduler()
+            logger.info(f"[群{group_id}] 机器人就绪")
+
+        # 启动共享 webhook 服务器
+        server = NapCatWebhookServer(
+            webhook_host, webhook_port, self.on_message,
+            target_group_ids=list(self.group_bots.keys()),
+        )
+        group_ids_str = ", ".join(self.group_bots.keys())
+        logger.info(f"机器人启动（监听群：{group_ids_str}）")
         server.start()
 
 
@@ -505,5 +564,5 @@ def _msg_to_text(msg) -> str:
 
 
 if __name__ == "__main__":
-    bot = Bot()
+    bot = MultiGroupBot()
     bot.run()
