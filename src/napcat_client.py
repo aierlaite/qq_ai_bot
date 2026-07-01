@@ -100,6 +100,50 @@ class NapCatClient:
             "emoji_id": emoji_id,
         })
 
+    # ---------- 媒体拉取 / 消息查询 ----------
+
+    def get_image(self, file: str) -> dict:
+        """获取图片信息（@deprecated OneBot 11 接口，但 NapCat 仍兼容）。
+
+        Args:
+            file: 收到的图片段中的 file 字段（如 "xxx.jpg" 或 file hash）
+        Returns:
+            {url, filename, ...}
+        """
+        return self._call("get_image", {"file": file}).get("data", {})
+
+    def get_record(self, file: str, out_format: str = "mp3") -> dict:
+        """获取语音文件信息。
+
+        Args:
+            file: 收到的 record 段中的 file 字段
+            out_format: 输出格式（mp3 / amr / wav）
+        """
+        return self._call("get_record", {
+            "file": file, "out_format": out_format,
+        }).get("data", {})
+
+    def get_msg(self, message_id: str) -> dict:
+        """获取消息详情（含完整消息段）。"""
+        return self._call("get_msg", {"message_id": message_id}).get("data", {})
+
+    def send_poke(self, user_id: str) -> dict:
+        """群内戳一戳（推荐使用 group_poke 接口）。
+
+        Args:
+            user_id: 要戳的群成员 QQ
+        """
+        return self._call("group_poke", {
+            "group_id": self.group_id,
+            "user_id": user_id,
+        })
+
+    def send_group_sign(self, user_id: str) -> dict:
+        """群内签到（部分 NapCat 版本支持）。"""
+        return self._call("send_group_sign", {
+            "group_id": self.group_id,
+        })
+
 
 class NapCatWebhookServer:
     """接收 NapCat HTTP 上报的 webhook 服务。

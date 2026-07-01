@@ -29,8 +29,8 @@ from src.parser import parse_and_validate
 from src.scheduler import ActiveScheduler
 from src.senders.message_sender import NapCatMessageSender
 from src.senders.voice_sender import AIRecordVoiceSender, LocalFileVoiceSender
-from src.senders.image_sender import EmptyImageSender
-from src.senders.emoji_reactor import EmptyEmojiReactor
+from src.senders.image_sender import NapCatImageSender
+from src.senders.emoji_reactor import NapCatEmojiReactor
 from src.utils.logger import get_logger
 
 logger = get_logger("main")
@@ -57,7 +57,9 @@ class GroupBot:
         self.llm = llm
         self.history = HistoryManager(config.trigger, state_dir=self.state_dir)
         self.attribution = AttributionManager(config, state_dir=self.state_dir)
-        self.affinity = AffinityManager(state_dir=self.state_dir)
+        protected_qq = (self.config.special_members.target_qq
+                        if self.config.special_members else "")
+        self.affinity = AffinityManager(state_dir=self.state_dir, protected_qq=protected_qq)
         self.persona_renderer = persona_renderer
         self.scheduler = ActiveScheduler(config, state_dir=self.state_dir)
 
@@ -67,8 +69,8 @@ class GroupBot:
             self.napcat, self.config.voice.ai_record_character, self.config.voice.fallback_to_text
         )
         self.local_voice_sender = LocalFileVoiceSender(self.napcat)
-        self.image_sender = EmptyImageSender()
-        self.emoji_reactor = EmptyEmojiReactor()
+        self.image_sender = NapCatImageSender(self.napcat)
+        self.emoji_reactor = NapCatEmojiReactor(self.napcat)
 
         # 运行时状态
         self.self_qq: str = ""
@@ -83,6 +85,38 @@ class GroupBot:
         self._quiet_timer_lock = threading.Lock()
         # 标记：自上次 LLM 调用以来是否有消息达到 peek 阈值（静默窗口兜底时检查）
         self._peek_qualified = False
+        # 注入 LLM 摘要器，对话压缩时生成真实摘要而非朴素截断
+        self.history.set_summarizer(self._summarize_history)
+
+    def _summarize_history(self, old_messages: list[dict], prev_summary: str) -> str:
+        """用 LLM 对早期对话做真实摘要，保留关键信息。
+
+        Args:
+            old_messages: 即将被丢弃的早期 user/assistant 消息对
+            prev_summary: 之前的摘要（要承接）
+        Returns:
+            新摘要字符串
+        """
+        parts = []
+        for i in range(0, len(old_messages), 2):
+            u = old_messages[i]["content"][:600] if i < len(old_messages) else ""
+            a = old_messages[i + 1]["content"][:400] if i + 1 < len(old_messages) else ""
+            parts.append(f"## 第{i // 2 + 1}轮\n用户看到的消息:\n{u}\n雪菜的回复(JSON):\n{a}")
+        conversation_text = "\n\n".join(parts[-12:])
+
+        system = (
+            "你是对话摘要器。把以下早期对话压缩成简短摘要（800字以内），"
+            "保留关键信息：涉及的人物（QQ/昵称）、讨论的话题、雪菜的情绪变化、"
+            "关系变化（亲密度升降）、重要约定或承诺、未解决的话题。"
+            "用简洁的叙述写，不要列点。只输出摘要文本，不要其他内容。"
+        )
+        user_content = f"之前的摘要：\n{prev_summary}\n\n需要压缩的早期对话：\n{conversation_text}"
+        try:
+            resp = self.llm.chat(system, [], user_content)
+            return resp.strip()
+        except Exception as e:
+            logger.warning(f"摘要 LLM 调用失败: {e}")
+            return ""
 
     def warmup(self):
         """启动预热。"""
@@ -413,10 +447,7 @@ class GroupBot:
                     handled = True
                     break
                 if seg.get("type") == "image":
-                    try:
-                        self.image_sender.send(self.config.napcat.group_id, seg.get("data", {}))
-                    except NotImplementedError:
-                        pass
+                    self.image_sender.send(self.config.napcat.group_id, seg.get("data", {}))
                     handled = True
                     break
                 if seg.get("type") == "voice":
@@ -428,13 +459,19 @@ class GroupBot:
                         self.local_voice_sender.send(self.config.napcat.group_id, data)
                     handled = True
                     break
+                if seg.get("type") == "poke":
+                    qq = seg.get("data", {}).get("qq", "")
+                    if qq:
+                        self.napcat.send_poke(qq)
+                    handled = True
+                    break
             if handled:
                 # 特殊段也记入 fast_buffer（语音/图片/转发都算一条 bot 发言）
                 self._append_bot_reply_to_buffer(messages[i])
                 continue
 
             # 普通消息段
-            normal_segs = [s for s in segs if s.get("type") not in ("forward", "image", "voice")]
+            normal_segs = [s for s in segs if s.get("type") not in ("forward", "image", "voice", "poke")]
             if normal_segs:
                 self.message_sender.send_group_message(self.config.napcat.group_id, normal_segs)
 
@@ -521,22 +558,74 @@ class MultiGroupBot:
 
 
 def _extract_text_from_msg(msg: dict) -> str:
-    """从消息段提取纯文本（图片转为 [图片] 占位）。"""
+    """从消息段提取纯文本（图片/语音/表情等转为占位标记）。"""
     parts = []
     for seg in msg.get("message", []):
-        if seg.get("type") == "text":
-            parts.append(seg.get("data", {}).get("text", ""))
-        elif seg.get("type") == "image":
-            parts.append("[图片]")
+        seg_type = seg.get("type", "")
+        data = seg.get("data", {})
+        if seg_type == "text":
+            parts.append(data.get("text", ""))
+        elif seg_type == "at":
+            qq = data.get("qq", "")
+            # at 段保留 @昵称 形式，让 LLM 看到谁被 @
+            name = data.get("name", "") or qq
+            parts.append(f"@{name}")
+        elif seg_type == "face":
+            # QQ 经典表情，标注 ID 让 LLM 知道用了哪个
+            face_id = data.get("id", "")
+            parts.append(f"[QQ表情:{face_id}]")
+        elif seg_type == "mface":
+            # QQ 商城表情包
+            keyword = data.get("emoji_name") or data.get("summary") or "表情包"
+            parts.append(f"[表情包:{keyword}]")
+        elif seg_type == "image":
+            # 图片：url 可能为空（NapCat 部分场景），有 summary 时附带
+            summary = data.get("summary", "")
+            if summary and summary != "[图片]":
+                parts.append(f"[图片:{summary}]")
+            else:
+                parts.append("[图片]")
+        elif seg_type == "record":
+            # 语音消息：转写文本可能存在 data.text 字段
+            text = data.get("text", "")
+            if text:
+                parts.append(f"[语音转写:{text}]")
+            else:
+                parts.append("[语音]")
+        elif seg_type == "reply":
+            # 引用回复段，跳过（不重复显示被引用内容）
+            pass
+        elif seg_type == "forward":
+            parts.append("[合并转发]")
+        elif seg_type == "json":
+            parts.append("[JSON卡片]")
+        elif seg_type == "xml":
+            parts.append("[XML卡片]")
+        elif seg_type == "poke":
+            # 戳一戳
+            parts.append("[戳一戳]")
+        else:
+            parts.append(f"[{seg_type}]")
     return "".join(parts)
 
 
 def _extract_images_from_msg(msg: dict) -> list:
-    """从消息段提取图片 URL 列表（用于多模态输入）。"""
+    """从消息段提取图片 URL 列表（用于多模态输入）。
+
+    同时提取 image 段和 mface 段（商城表情包）的 url，
+    让 LLM 在多模态模式下能"看到"群里发的图片和表情包。
+    """
     images = []
     for seg in msg.get("message", []):
-        if seg.get("type") == "image":
-            url = seg.get("data", {}).get("url", "")
+        seg_type = seg.get("type", "")
+        data = seg.get("data", {})
+        if seg_type == "image":
+            url = data.get("url", "")
+            if url:
+                images.append(url)
+        elif seg_type == "mface":
+            # 商城表情包也有 url
+            url = data.get("url", "")
             if url:
                 images.append(url)
     return images
@@ -554,11 +643,16 @@ def _msg_to_text(msg) -> str:
         if t == "at":
             return f"@{d.get('qq', '')}"
         if t == "face":
-            return f"[face:{d.get('id', '')}]"
+            return f"[QQ表情:{d.get('id', '')}]"
+        if t == "mface":
+            keyword = d.get("emoji_name") or d.get("summary") or "表情包"
+            return f"[表情包:{keyword}]"
         if t == "image":
             return "[图片]"
         if t == "voice":
             return f"[语音:{d.get('text', '')}]"
+        if t == "poke":
+            return "[戳一戳]"
         return f"[{t}]"
     return ""
 
