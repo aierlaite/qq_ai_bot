@@ -26,20 +26,42 @@ class NapCatClient:
 
     # ---------- 启动预热 ----------
     def warmup(self):
-        """启动时预热：拉取自身信息和群成员列表。"""
+        """启动时预热：同步拉取自身信息，后台拉取群成员列表。
+
+        NapCat 的 get_group_member_info 在某些环境下会很慢（每成员 10s 超时），
+        若同步串行拉取会阻塞主线程启动。改为后台线程拉取，失败不阻塞；
+        self_info 必须同步获取（后续 warmup 依赖 self_qq / nickname）。
+        """
         self.self_info = self.get_login_info()
         logger.info(f"机器人身份：{self.self_info.get('nickname')}({self.self_info.get('user_id')})")
+        Thread(target=self._warmup_members, daemon=True).start()
+
+    def _warmup_members(self):
+        """后台拉取群成员信息（失败跳过，不阻塞主流程）。"""
         members = self.get_group_member_list()
-        for m in members:
+        total = len(members)
+        if total == 0:
+            logger.warning("群成员列表为空，跳过预热")
+            return
+        failed = 0
+        for i, m in enumerate(members, 1):
             qq = str(m.get("user_id"))
-            detail = self.get_group_member_info(qq)
+            detail = self._call("get_group_member_info", {
+                "group_id": self.group_id,
+                "user_id": qq,
+            }).get("data", {})
+            if not detail:
+                failed += 1
+                continue
             self.member_cache[qq] = {
                 "nickname": detail.get("nickname", ""),
                 "card": detail.get("card", ""),
                 "role": detail.get("role", "member"),
                 "title": detail.get("title", ""),
             }
-        logger.info(f"群成员缓存：{len(self.member_cache)} 人")
+            if i % 10 == 0:
+                logger.info(f"群成员缓存进度：{i}/{total}")
+        logger.info(f"群成员缓存完成：{len(self.member_cache)}/{total} 人（失败 {failed}）")
 
     def get_nickname(self, qq: str) -> str:
         """从缓存取昵称（优先群名片）。"""
