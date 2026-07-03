@@ -53,7 +53,12 @@ class NapCatClient:
         try:
             resp = requests.post(url, json=payload, timeout=10)
             resp.raise_for_status()
-            return resp.json()
+            result = resp.json()
+            # 检查 OneBot 响应体中的 retcode（0=成功，非0=失败）
+            retcode = result.get("retcode", 0)
+            if retcode != 0:
+                logger.warning(f"调用 {endpoint} 返回错误: retcode={retcode}, msg={result.get('msg', '')}, wording={result.get('wording', '')}")
+            return result
         except Exception as e:
             logger.error(f"调用 {endpoint} 失败: {e}")
             return {}
