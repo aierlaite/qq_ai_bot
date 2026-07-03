@@ -3,10 +3,13 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import requests, json
+import yaml
 
-api_url = "https://integrate.api.nvidia.com/v1/chat/completions"
-api_key = "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"
-model = "qwen/qwen3.5-397b-a17b"
+with open("config.yaml", "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+api_url = cfg["llm"]["api_url"]
+api_key = cfg["llm"]["api_key"]
+model = cfg["llm"]["model"]
 
 headers = {
     "Content-Type": "application/json",

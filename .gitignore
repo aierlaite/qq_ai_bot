@@ -27,6 +27,7 @@ wheels/
 config.yaml
 .env
 *.env
+任务描述.md
 
 # 运行状态
 state/
