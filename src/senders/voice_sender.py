@@ -1,10 +1,8 @@
-"""语音发送器实现。
+"""语音发送器。
 
-双通道：ai_record（NapCat AI 语音）/ local_file（本地音频转 OB11MessageRecord）。
-通过 VoiceSender 接口隔离，未来可插入新 TTS 引擎。
+AIRecordVoiceSender: 通过 NapCat send_group_ai_record 发送 AI 合成语音。
+LocalFileVoiceSender: 通过 send_group_msg 发送本地音频文件（record 段）。
 """
-from pathlib import Path
-
 from ..napcat_client import NapCatClient
 from ..utils.logger import get_logger
 
@@ -12,55 +10,54 @@ logger = get_logger("voice_sender")
 
 
 class AIRecordVoiceSender:
-    """AI 语音发送器，调用 /send_group_ai_record。"""
+    """AI 语音发送器。
 
-    def __init__(self, client: NapCatClient, character: str, fallback_to_text: bool = False):
+    调用 NapCat 的 send_group_ai_record 接口，由 NapCat 端合成语音并发送。
+    """
+
+    def __init__(self, client: NapCatClient, character: str, fallback_to_text: bool = True):
         self.client = client
         self.character = character
         self.fallback_to_text = fallback_to_text
 
-    def send(self, group_id: str, voice_data: dict) -> dict:
+    def send(self, group_id: str, data: dict) -> dict:
         """发送 AI 语音。
 
         Args:
-            group_id: 目标群号
-            voice_data: 含 text 字段
+            group_id: 群号（client 已绑定，此处仅日志用）
+            data: 语音数据，需含 text 字段
         """
-        text = voice_data.get("text", "")
+        text = data.get("text", "").strip()
         if not text:
-            logger.warning("voice 段缺少 text，跳过")
+            logger.warning("AI 语音缺少 text，跳过")
             return {}
-
-        try:
-            return self.client.send_group_ai_record(self.character, text)
-        except Exception as e:
-            logger.error(f"AI 语音发送失败: {e}")
-            if self.fallback_to_text:
-                logger.info("降级为 text 段发送")
-                return self.client.send_group_msg([
-                    {"type": "text", "data": {"text": text}},
-                ])
-            return {}
+        logger.info(f"发送 AI 语音 character={self.character} text={text[:30]}")
+        result = self.client.send_group_ai_record(self.character, text)
+        if not result.get("ok") and self.fallback_to_text:
+            logger.info("AI 语音发送失败，回退为文字")
+            return self.client.send_group_msg([{"type": "text", "data": {"text": text}}])
+        return result
 
 
 class LocalFileVoiceSender:
-    """本地音频文件发送器，构造 OB11MessageRecord 段。"""
+    """本地音频文件发送器。
+
+    通过 send_group_msg 发送 record 段。
+    """
 
     def __init__(self, client: NapCatClient):
         self.client = client
 
-    def send(self, group_id: str, voice_data: dict) -> dict:
+    def send(self, group_id: str, data: dict) -> dict:
         """发送本地音频文件。
 
         Args:
-            group_id: 目标群号
-            voice_data: 含 file 字段（本地音频路径）
+            group_id: 群号（client 已绑定，此处仅日志用）
+            data: 语音数据，需含 file 字段（文件路径或 file:// URL）
         """
-        file_path = voice_data.get("file", "")
-        if not file_path or not Path(file_path).exists():
-            logger.warning(f"voice 本地文件不存在: {file_path}")
+        file = data.get("file", "").strip()
+        if not file:
+            logger.warning("本地语音缺少 file，跳过")
             return {}
-
-        # 构造 OB11MessageRecord 段（file:// 协议或绝对路径）
-        record_seg = [{"type": "record", "data": {"file": file_path}}]
-        return self.client.send_group_msg(record_seg)
+        logger.info(f"发送本地语音 file={file}")
+        return self.client.send_group_msg([{"type": "record", "data": {"file": file}}])

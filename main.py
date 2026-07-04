@@ -437,9 +437,6 @@ class GroupBot:
         multi_reply 逐条 append，中间间隔期间群成员插话会自然夹在 bot 消息之间。
         """
         segments_list = self.message_sender.build_segments(messages, self.history)
-        if not segments_list:
-            logger.warning(f"build_segments 返回空列表，messages={messages}，无内容发送")
-            return
         for i, segs in enumerate(segments_list):
             # 处理特殊段
             handled = False
@@ -447,18 +444,15 @@ class GroupBot:
                 if seg.get("type") == "forward":
                     data = seg.get("data", {})
                     self.napcat.send_group_forward_msg(data.get("messages", []), data.get("title", ""))
-                    logger.info(f"发送 forward 段")
                     handled = True
                     break
                 if seg.get("type") == "image":
                     self.image_sender.send(self.config.napcat.group_id, seg.get("data", {}))
-                    logger.info(f"发送 image 段")
                     handled = True
                     break
                 if seg.get("type") == "voice":
                     data = seg.get("data", {})
                     channel = data.get("channel", "ai_record")
-                    logger.info(f"发送 voice 段: channel={channel}, text={data.get('text', '')[:30]}")
                     if channel == "ai_record":
                         self.ai_voice_sender.send(self.config.napcat.group_id, data)
                     elif channel == "local_file":
@@ -469,7 +463,6 @@ class GroupBot:
                     qq = seg.get("data", {}).get("qq", "")
                     if qq:
                         self.napcat.send_poke(qq)
-                        logger.info(f"发送 poke 段: qq={qq}")
                     handled = True
                     break
             if handled:
@@ -480,16 +473,7 @@ class GroupBot:
             # 普通消息段
             normal_segs = [s for s in segs if s.get("type") not in ("forward", "image", "voice", "poke")]
             if normal_segs:
-                seg_types = [s.get("type") for s in normal_segs]
-                text_preview = ""
-                for s in normal_segs:
-                    if s.get("type") == "text":
-                        text_preview = s.get("data", {}).get("text", "")[:50]
-                        break
-                logger.info(f"发送消息: types={seg_types}, text={text_preview}")
                 self.message_sender.send_group_message(self.config.napcat.group_id, normal_segs)
-            else:
-                logger.warning(f"消息 {i} 无可发送的普通段，segs={segs}")
 
             # 逐条 append 到 fast_buffer（与群消息按真实时间顺序混合）
             self._append_bot_reply_to_buffer(messages[i])
@@ -547,8 +531,9 @@ class MultiGroupBot:
             bot = GroupBot(group_id, self.config, self.llm, self.persona_renderer)
             self.group_bots[group_id] = bot
 
-    def on_message(self, group_id: str, msg: dict):
-        """Webhook 回调：按 group_id 分发到对应 GroupBot。"""
+    def on_message(self, msg: dict):
+        """Webhook 回调：从 msg 中提取 group_id 分发到对应 GroupBot。"""
+        group_id = str(msg.get("group_id", ""))
         bot = self.group_bots.get(group_id)
         if bot is None:
             logger.debug(f"收到非目标群消息：{group_id}，丢弃")
@@ -563,10 +548,9 @@ class MultiGroupBot:
             bot.start_scheduler()
             logger.info(f"[群{group_id}] 机器人就绪")
 
-        # 启动共享 webhook 服务器
+        # 启动共享 webhook 服务器（不做群过滤，由 on_message 内部分发）
         server = NapCatWebhookServer(
             webhook_host, webhook_port, self.on_message,
-            target_group_ids=list(self.group_bots.keys()),
         )
         group_ids_str = ", ".join(self.group_bots.keys())
         logger.info(f"机器人启动（监听群：{group_ids_str}）")

@@ -1,6 +1,6 @@
-"""emoji 反应器实现。
+"""emoji 反应器。
 
-调用 NapCat /set_msg_emoji_like 对群消息添加 QQ 自带 emoji 反应。
+通过 NapCat set_msg_emoji_like 对消息添加表情反应。
 """
 from ..napcat_client import NapCatClient
 from ..utils.logger import get_logger
@@ -9,33 +9,25 @@ logger = get_logger("emoji_reactor")
 
 
 class NapCatEmojiReactor:
-    """NapCat emoji 反应器，调用 set_msg_emoji_like。"""
+    """NapCat emoji 反应器。"""
 
     def __init__(self, client: NapCatClient):
         self.client = client
 
     def react(self, group_id: str, msg_id: str, emoji_id: str) -> dict:
-        """对群消息添加 emoji 反应。
+        """对指定消息添加表情反应。
 
         Args:
-            group_id: 目标群号（当前实现由 client 内部持有，参数保留兼容）
-            msg_id: 要反应的消息 ID
-            emoji_id: QQ 表情 ID（如 "66""99" 等）
+            group_id: 群号（set_msg_emoji_like 按 msg_id 定位，group_id 仅日志用）
+            msg_id: 目标消息 ID
+            emoji_id: face ID（如 "66" 点赞）
         """
-        if not msg_id:
-            logger.warning("emoji 反应跳过：msg_id 为空")
+        if not msg_id or not emoji_id:
+            logger.warning(f"emoji 反应缺少参数 msg_id={msg_id} emoji_id={emoji_id}，跳过")
             return {}
-        if not emoji_id:
-            logger.warning("emoji 反应跳过：emoji_id 为空")
-            return {}
+        logger.info(f"emoji 反应 msg_id={msg_id} emoji_id={emoji_id}")
         try:
-            result = self.client.set_msg_emoji_like(msg_id, str(emoji_id))
-            logger.info(f"emoji 反应已发送：msg_id={msg_id} emoji_id={emoji_id}")
-            return result
+            return self.client.set_msg_emoji_like(msg_id, str(emoji_id))
         except Exception as e:
-            logger.error(f"emoji 反应发送失败: {e}")
+            logger.warning(f"emoji 反应异常: {e}")
             return {}
-
-
-# 向后兼容：保留 EmptyEmojiReactor 别名
-EmptyEmojiReactor = NapCatEmojiReactor

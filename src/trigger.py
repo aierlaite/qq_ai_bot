@@ -85,11 +85,6 @@ class TriggerEvaluator:
                 friend_speak_hit = True
         if friend_speak_hit:
             friend_speak_base = int(affinity_value * FRIEND_SPEAK_SCALE)  # 亲密度贡献作为 base_value
-            # 特殊成员权重调整：对特定 QQ 号降低 friend_speak 权重
-            if self.config.special_members and str(self.config.special_members.target_qq) == sender_qq:
-                weight = self.config.special_members.friend_speak_weight
-                friend_speak_base = int(friend_speak_base * weight)
-                logger.debug(f"特殊成员 {sender_qq} friend_speak 权重调整为 {weight}")
         else:
             friend_speak_base = 0
         factors.append(TriggerFactor(

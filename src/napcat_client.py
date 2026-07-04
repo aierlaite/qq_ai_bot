@@ -26,42 +26,20 @@ class NapCatClient:
 
     # ---------- 启动预热 ----------
     def warmup(self):
-        """启动时预热：同步拉取自身信息，后台拉取群成员列表。
-
-        NapCat 的 get_group_member_info 在某些环境下会很慢（每成员 10s 超时），
-        若同步串行拉取会阻塞主线程启动。改为后台线程拉取，失败不阻塞；
-        self_info 必须同步获取（后续 warmup 依赖 self_qq / nickname）。
-        """
+        """启动时预热：拉取自身信息和群成员列表。"""
         self.self_info = self.get_login_info()
         logger.info(f"机器人身份：{self.self_info.get('nickname')}({self.self_info.get('user_id')})")
-        Thread(target=self._warmup_members, daemon=True).start()
-
-    def _warmup_members(self):
-        """后台拉取群成员信息（失败跳过，不阻塞主流程）。"""
         members = self.get_group_member_list()
-        total = len(members)
-        if total == 0:
-            logger.warning("群成员列表为空，跳过预热")
-            return
-        failed = 0
-        for i, m in enumerate(members, 1):
+        for m in members:
             qq = str(m.get("user_id"))
-            detail = self._call("get_group_member_info", {
-                "group_id": self.group_id,
-                "user_id": qq,
-            }).get("data", {})
-            if not detail:
-                failed += 1
-                continue
+            detail = self.get_group_member_info(qq)
             self.member_cache[qq] = {
                 "nickname": detail.get("nickname", ""),
                 "card": detail.get("card", ""),
                 "role": detail.get("role", "member"),
                 "title": detail.get("title", ""),
             }
-            if i % 10 == 0:
-                logger.info(f"群成员缓存进度：{i}/{total}")
-        logger.info(f"群成员缓存完成：{len(self.member_cache)}/{total} 人（失败 {failed}）")
+        logger.info(f"群成员缓存：{len(self.member_cache)} 人")
 
     def get_nickname(self, qq: str) -> str:
         """从缓存取昵称（优先群名片）。"""
@@ -75,12 +53,7 @@ class NapCatClient:
         try:
             resp = requests.post(url, json=payload, timeout=10)
             resp.raise_for_status()
-            result = resp.json()
-            # 检查 OneBot 响应体中的 retcode（0=成功，非0=失败）
-            retcode = result.get("retcode", 0)
-            if retcode != 0:
-                logger.warning(f"调用 {endpoint} 返回错误: retcode={retcode}, msg={result.get('msg', '')}, wording={result.get('wording', '')}")
-            return result
+            return resp.json()
         except Exception as e:
             logger.error(f"调用 {endpoint} 失败: {e}")
             return {}
@@ -120,6 +93,29 @@ class NapCatClient:
             "title": title,
         })
 
+    def get_image(self, file: str) -> dict:
+        """获取图片信息。"""
+        return self._call("get_image", {"file": file}).get("data", {})
+
+    def get_record(self, file: str, out_format: str = "wav") -> dict:
+        """获取语音文件信息。"""
+        return self._call("get_record", {"file": file, "out_format": out_format}).get("data", {})
+
+    def get_msg(self, message_id: str) -> dict:
+        """获取消息详情。"""
+        return self._call("get_msg", {"message_id": message_id}).get("data", {})
+
+    def send_poke(self, user_id: str) -> dict:
+        """发送群戳一戳。"""
+        return self._call("group_poke", {
+            "group_id": self.group_id,
+            "user_id": user_id,
+        })
+
+    def send_group_sign(self, content: str = "") -> dict:
+        """发送群签到。"""
+        return self._call("send_group_sign", {"group_id": self.group_id})
+
     def set_msg_emoji_like(self, message_id: str, emoji_id: str) -> dict:
         """对消息做 emoji 反应。"""
         return self._call("set_msg_emoji_like", {
@@ -127,70 +123,26 @@ class NapCatClient:
             "emoji_id": emoji_id,
         })
 
-    # ---------- 媒体拉取 / 消息查询 ----------
-
-    def get_image(self, file: str) -> dict:
-        """获取图片信息（@deprecated OneBot 11 接口，但 NapCat 仍兼容）。
-
-        Args:
-            file: 收到的图片段中的 file 字段（如 "xxx.jpg" 或 file hash）
-        Returns:
-            {url, filename, ...}
-        """
-        return self._call("get_image", {"file": file}).get("data", {})
-
-    def get_record(self, file: str, out_format: str = "mp3") -> dict:
-        """获取语音文件信息。
-
-        Args:
-            file: 收到的 record 段中的 file 字段
-            out_format: 输出格式（mp3 / amr / wav）
-        """
-        return self._call("get_record", {
-            "file": file, "out_format": out_format,
-        }).get("data", {})
-
-    def get_msg(self, message_id: str) -> dict:
-        """获取消息详情（含完整消息段）。"""
-        return self._call("get_msg", {"message_id": message_id}).get("data", {})
-
-    def send_poke(self, user_id: str) -> dict:
-        """群内戳一戳（推荐使用 group_poke 接口）。
-
-        Args:
-            user_id: 要戳的群成员 QQ
-        """
-        return self._call("group_poke", {
-            "group_id": self.group_id,
-            "user_id": user_id,
-        })
-
-    def send_group_sign(self, user_id: str) -> dict:
-        """群内签到（部分 NapCat 版本支持）。"""
-        return self._call("send_group_sign", {
-            "group_id": self.group_id,
-        })
-
 
 class NapCatWebhookServer:
     """接收 NapCat HTTP 上报的 webhook 服务。
 
     NapCat 收到群消息后会 POST 到本服务，触发回调。
-    若设置 target_group_ids，则只处理这些群的消息，其他群消息直接丢弃。
+    若设置 target_group_id，则只处理该群消息，其他群消息直接丢弃。
     """
 
-    def __init__(self, host: str, port: int, on_message: Callable[[str, dict], None],
-                 target_group_ids: Optional[list[str]] = None):
+    def __init__(self, host: str, port: int, on_message: Callable[[dict], None],
+                 target_group_id: Optional[str] = None):
         self.host = host
         self.port = port
         self.on_message = on_message
-        self.target_group_ids = target_group_ids or []
+        self.target_group_id = target_group_id
         self._server: Optional[HTTPServer] = None
 
     def start(self):
         """启动 webhook 服务（阻塞）。"""
         on_message = self.on_message
-        target_group_ids = self.target_group_ids
+        target_group_id = self.target_group_id
 
         class Handler(BaseHTTPRequestHandler):
             def _read_body(self):
@@ -235,14 +187,14 @@ class NapCatWebhookServer:
                     if post_type == "message" and data.get("message_type") == "group":
                         # 群过滤：只处理目标群消息，其他群直接丢弃
                         msg_group_id = str(data.get("group_id", ""))
-                        if target_group_ids and msg_group_id not in target_group_ids:
+                        if target_group_id and msg_group_id != target_group_id:
                             logger.debug(
                                 f"丢弃非目标群消息：group_id={msg_group_id} "
-                                f"(期望 {target_group_ids}) user={data.get('user_id')}"
+                                f"(期望 {target_group_id}) user={data.get('user_id')}"
                             )
                         else:
-                            # 异步处理消息，传递 group_id 给回调，do_POST 立即返回 200
-                            Thread(target=on_message, args=(msg_group_id, data), daemon=True).start()
+                            # 异步处理消息，do_POST 立即返回 200，避免阻塞 NapCat
+                            Thread(target=on_message, args=(data,), daemon=True).start()
                 except Exception as e:
                     logger.error(f"处理上报失败: {e}")
                 self.send_response(200)

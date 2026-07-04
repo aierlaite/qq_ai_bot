@@ -1,6 +1,6 @@
 """消息发送器实现。
 
-负责 text/at/reply/face/forward 等普通段的拼装与发送。
+负责 text/at/reply/face/mface/forward/image/voice/poke 等段的拼装与发送。
 
 额外职责：对 text 段做占位符清洗——LLM 偶尔会把群消息里的占位符
 （如 [QQ表情:66]、@123456）当文本原样输出，这里解析回真正的消息段。
@@ -12,11 +12,8 @@ from ..utils.logger import get_logger
 
 logger = get_logger("message_sender")
 
-# 匹配 [QQ表情:66] / [QQ 表情:66] / [QQ表情: 66] 等变体
 _FACE_PLACEHOLDER_RE = re.compile(r"\[QQ\s*表情\s*[:：]\s*(\d+)\]")
-# 匹配 [表情包:关键词]（商城表情包占位符）
 _MFACE_PLACEHOLDER_RE = re.compile(r"\[表情包[:：]\s*([^\]]+)\]")
-# 匹配 @纯数字（5-11 位 QQ 号），前后不能是其他数字或字母
 _AT_PLACEHOLDER_RE = re.compile(r"(?<![0-9a-zA-Z])@(\d{5,11})(?![0-9a-zA-Z])")
 
 
@@ -34,13 +31,6 @@ class NapCatMessageSender:
         """把模型输出的 messages 转换为 OneBot 消息段数组的列表。
 
         每条消息转换为一段数组（可能含多段），返回多条消息的段数组列表。
-
-        Args:
-            messages: 模型输出的 messages 列表（字符串或 dict）
-            history: 历史记录管理器（用于 reply 段取 message_id）
-
-        Returns:
-            list of list of segment dict
         """
         result = []
         for msg in messages:
@@ -80,8 +70,6 @@ class NapCatMessageSender:
             return [{"type": "face", "data": {"id": str(data.get("id", ""))}}]
 
         if msg_type == "mface":
-            # QQ 商城表情包：emoji_package_id + emoji_id + key + summary 决定具体表情
-            # LLM 只需提供 summary（关键词描述）或 url，发送时透传所有字段
             mface_data = {}
             for k in ("emoji_package_id", "emoji_id", "key", "summary", "url",
                       "emoji_name", "tip"):
@@ -94,24 +82,16 @@ class NapCatMessageSender:
             return [{"type": "mface", "data": mface_data}]
 
         if msg_type == "forward":
-            # forward 由专用 API 发送，这里返回标记
             return [{"type": "forward", "data": data}]
 
+        if msg_type == "image":
+            return [{"type": "image", "data": data}]
+
         if msg_type == "voice":
-            # voice 由专用发送器处理，这里透传标记
-            text = data.get("text", "")
-            if not text:
-                logger.warning("voice 段缺少 text，跳过")
-                return []
             return [{"type": "voice", "data": data}]
 
         if msg_type == "poke":
-            # poke 由专用 API（group_poke）发送，这里透传标记
-            qq = str(data.get("qq", ""))
-            if not qq:
-                logger.warning("poke 段缺少 qq，跳过")
-                return []
-            return [{"type": "poke", "data": {"qq": qq}}]
+            return [{"type": "poke", "data": data}]
 
         logger.warning(f"未知消息段 type={msg_type}，跳过")
         return []
@@ -123,21 +103,12 @@ class NapCatMessageSender:
         - [QQ表情:66] / [QQ 表情:66] → face 段
         - [表情包:关键词] → mface 段（透传 summary）
         - @123456789（5-11 位数字） → at 段
-
-        剩余的纯文本作为 text 段保留。空文本不产生段。
-
-        Args:
-            text: 原始文本
-
-        Returns:
-            消息段列表，可能包含 text/face/mface/at 段混合
         """
         if not text:
             return []
 
         segs = []
         cursor = 0
-        # 合并三种占位符的匹配，按位置排序处理
         matches = []
         for m in _FACE_PLACEHOLDER_RE.finditer(text):
             matches.append((m.start(), m.end(), "face", m.group(1)))
@@ -148,13 +119,10 @@ class NapCatMessageSender:
         matches.sort(key=lambda x: x[0])
 
         for start, end, seg_type, value in matches:
-            # 跳过重叠匹配（已处理过的区间）
             if start < cursor:
                 continue
-            # 先收集前面的纯文本
             if start > cursor:
                 segs.append({"type": "text", "data": {"text": text[cursor:start]}})
-            # 加入对应的段
             if seg_type == "face":
                 segs.append({"type": "face", "data": {"id": value}})
             elif seg_type == "mface":
@@ -163,7 +131,6 @@ class NapCatMessageSender:
                 segs.append({"type": "at", "data": {"qq": value}})
             cursor = end
 
-        # 收集末尾剩余文本
         if cursor < len(text):
             segs.append({"type": "text", "data": {"text": text[cursor:]}})
 

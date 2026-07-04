@@ -50,15 +50,9 @@ class HistoryManager:
         # 延迟回复缓冲：LLM 觉得"等会再回"时，把这批 pending 消息存到这里
         # 格式：[{"due_time":"ISO时间戳", "messages":[{同 pending 格式}]}]
         self.delayed_replies: list[dict] = []
-        # 可选的 LLM 摘要器：set_summarizer(callback) 注入
-        # callback(old_messages: list[dict], prev_summary: str) -> str
-        # 若未注入，_check_compress 退化为朴素截断
-        self.summarizer = None
+        # LLM 摘要器（由 main.py 注入，_check_compress 使用）
+        self._summarizer = None
         self._load()
-
-    def set_summarizer(self, callback):
-        """注入 LLM 摘要器，用于压缩时生成真实摘要。"""
-        self.summarizer = callback
 
     # ---------- 持久化 ----------
     def _load(self):
@@ -82,6 +76,14 @@ class HistoryManager:
             }, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    def set_summarizer(self, summarizer_fn):
+        """注入 LLM 摘要器（由 main.py 调用）。
+
+        Args:
+            summarizer_fn: callable(old_messages, prev_summary) -> str
+        """
+        self._summarizer = summarizer_fn
 
     # ---------- 群消息追加（入 fast_buffer，接收线程 / LLM 线程均调用） ----------
     def append_group_message(self, qq: str, nickname: str, content: str, msg_id: str,
@@ -183,7 +185,7 @@ class HistoryManager:
 
         触发条件：user/assistant 对数 >= history_limit / 2。
         压缩策略：保留近 history_keep_recent / 2 轮原文，早期转摘要塞进 system 末尾。
-        若注入了 summarizer（LLM 摘要器），调用它生成真实摘要；否则退化为朴素截断。
+        若 _summarizer 已注入（LLM 摘要器），调用生成真实摘要；否则朴素截断。
         """
         turn_count = len(self.messages) // 2
         max_turns = self.config.history_limit // 2
@@ -195,17 +197,17 @@ class HistoryManager:
         old_msgs = self.messages[:-keep_msgs]
         self.messages = self.messages[-keep_msgs:]
 
-        if self.summarizer:
+        if self._summarizer is not None:
             try:
-                new_summary = self.summarizer(old_msgs, self.summary)
+                new_summary = self._summarizer(old_msgs, self.summary)
                 if new_summary and new_summary.strip():
-                    self.summary = new_summary.strip()[-1500:]
+                    self.summary = new_summary.strip()[:2000]
                     logger.info(f"LLM 摘要压缩：保留近 {keep_turns} 轮，摘要 {len(self.summary)} 字")
                     return
             except Exception as e:
-                logger.warning(f"LLM 摘要失败，退化为朴素截断: {e}")
+                logger.warning(f"LLM 摘要失败，回退朴素截断: {e}")
 
-        # 朴素 fallback：截断保留要点
+        # 朴素摘要：截断保留要点
         old_text_parts = []
         for i in range(0, len(old_msgs), 2):
             if i + 1 < len(old_msgs):
@@ -213,8 +215,8 @@ class HistoryManager:
                 a = old_msgs[i + 1]["content"][:100]
                 old_text_parts.append(f"U:{u}\nA:{a}")
         old_summary_chunk = " || ".join(old_text_parts[-5:])
-        self.summary = (self.summary + " " + old_summary_chunk).strip()[-1500:]
-        logger.info(f"朴素压缩：保留近 {keep_turns} 轮，摘要 {len(self.summary)} 字")
+        self.summary = (self.summary + " " + old_summary_chunk).strip()[-800:]
+        logger.info(f"对话压缩：保留近 {keep_turns} 轮，摘要 {len(self.summary)} 字")
 
     # ---------- 查询 ----------
     def get_messages_for_llm(self) -> list[dict]:
